@@ -1,7 +1,8 @@
 // Copyright (c) 2025, IBSL and contributors
 // For license information, please see license.txt
 
-frappe.query_reports["Monthly Attendance Sheet With Leave Type"] = {
+
+frappe.query_reports["Monthly Attendance Sheet With Leave Detail"] = {
 	filters: [
 		{
 			fieldname: "month",
