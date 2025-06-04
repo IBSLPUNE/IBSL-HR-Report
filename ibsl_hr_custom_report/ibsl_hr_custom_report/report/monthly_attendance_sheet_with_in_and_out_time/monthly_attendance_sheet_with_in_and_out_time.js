@@ -2,7 +2,7 @@
 // For license information, please see license.txt
 
 
-frappe.query_reports["Monthly Attendance Sheet WIth In And Out Time"] = {
+frappe.query_reports["Monthly Attendance Sheet With In And Out Time"] = {
 	"filters": [
 		{
 			"fieldname": "month",
