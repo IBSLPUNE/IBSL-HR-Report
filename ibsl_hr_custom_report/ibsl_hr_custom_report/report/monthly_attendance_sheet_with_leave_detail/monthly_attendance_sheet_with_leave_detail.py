@@ -510,6 +510,22 @@ def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Di
 
 	return summary[0], days
 
+from datetime import datetime
+import calendar
+def calculate_working_hours(in_time, out_time):
+    """Returns working hours as HH:MM from in_time and out_time."""
+    if not in_time or not out_time:
+        return ""
+    try:
+        in_dt = in_time if isinstance(in_time, datetime) else datetime.strptime(in_time, "%Y-%m-%d %H:%M:%S")
+        out_dt = out_time if isinstance(out_time, datetime) else datetime.strptime(out_time, "%Y-%m-%d %H:%M:%S")
+        delta = out_dt - in_dt
+        total_seconds = delta.total_seconds()
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        return f"{hours:02}:{minutes:02}"
+    except Exception:
+        return ""
 
 def get_attendance_status_for_detailed_view(
     employee: str, filters: Filters, employee_attendance: Dict, holidays: List
@@ -521,7 +537,10 @@ def get_attendance_status_for_detailed_view(
     ]
     """
     total_days = get_total_days_in_month(filters)
+    year = int(filters.year)
+    month_num = int(filters.month)
     attendance_values = []
+    #frappe.throw(str(filters.month))
 
     for shift, status_dict in employee_attendance.items():
         row = {"shift": shift}
@@ -529,21 +548,65 @@ def get_attendance_status_for_detailed_view(
         for day in range(1, total_days + 1):
             day_str = cstr(day)
             status_info = status_dict.get(day)
+            #frappe.throw(str(status_info))
             if status_info is None and holidays:
                 status_info = {'status': get_holiday_status(day, holidays)}
 
             if isinstance(status_info, dict):
                 status = status_info.get('status')
+                #da=status_info.get("name")
+                #frappe.throw(str(da))
+                #wo=status_info.get('in_time')
+                in_time = status_info.get('in_time')
+                out_time = status_info.get('out_time')
+                #frappe.throw(str(status_info))
                 #in_time = extract_time(status_info.get('in_time', ''))
                 #out_time = extract_time(status_info.get('out_time', ''))
                 leave_type = status_info.get('leave_type', '')
+                #att_doc = frappe.get_value("Attendance", {"employee": employee, "attendance_date": f"{year}-{month:02d}-{int(day_str):02d}"}, ["in_time", "out_time"], as_dict=True)
                 abbr = status_map.get(status, "")
                 row[day_str] = abbr
+                if abbr == "HD" and (not in_time or not out_time):
+                    att_doc = frappe.get_value(
+                        "Attendance",
+                        {
+                            "employee": employee,
+                            "attendance_date": f"{year}-{month_num:02d}-{int(day_str):02d}"
+                        },
+                        ["in_time", "out_time"],
+                        as_dict=True
+                    )
+                    if att_doc:
+                        in_time = att_doc.in_time
+                        out_time = att_doc.out_time
+
+                # Calculate working hours
+                wo = calculate_working_hours(in_time, out_time)
+                #wo = calculate_working_hours(in_time, out_time)
                 #row[f"in_time_{day_str}"] = in_time
                 if leave_type:
-                	row[day_str] = leave_type
+                    cell_value = leave_type
                 else:
-                	row[day_str] = abbr
+                    if abbr == "HD":
+                        cell_value = f"{abbr} - {wo if wo else '04:00'} hrs"
+                    else:
+                        cell_value = f"{abbr} - {wo} hrs" if wo else abbr
+
+                # Apply color coding
+                if abbr == "P":
+                    cell_value = f'<span style="color: green;">{cell_value}</span>'
+                elif abbr == "A":
+                    cell_value = f'<span style="color: red;">{cell_value}</span>'
+                elif abbr == "L":
+                    cell_value = f'<span style="color: #4682b4;">{cell_value}</span>'
+                elif abbr == "HD":
+                    cell_value = f'<span style="color: orange;">{cell_value}</span>'
+
+                row[day_str] = cell_value
+                #if leave_type:
+                	#row[day_str] = leave_type
+                #else:
+                	#row[day_str] = f"{abbr} - {wo} hrs" if wo else abbr
                 #row[f"out_time_{day_str}"] = out_time
             else:
                 status = status_info
