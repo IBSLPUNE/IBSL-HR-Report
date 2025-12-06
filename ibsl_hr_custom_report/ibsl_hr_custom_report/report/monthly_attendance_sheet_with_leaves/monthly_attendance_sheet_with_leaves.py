@@ -1,7 +1,6 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-
 from calendar import monthrange
 from itertools import groupby
 from typing import Dict, List, Optional, Tuple
@@ -12,31 +11,62 @@ from frappe.query_builder.functions import Count, Extract, Sum
 from frappe.utils import cint, cstr, getdate
 
 Filters = frappe._dict
+from calendar import monthrange
+from datetime import date
+from itertools import groupby
+
+from pypika import Field
+from pypika.terms import Criterion
+
+import frappe
+from frappe import _
+from frappe.query_builder import Case
+from frappe.query_builder.functions import Count, Extract, Sum
+from frappe.utils import cint, cstr, formatdate, getdate
+from frappe.utils.nestedset import get_descendants_of
+
+from hrms.utils import date_diff, get_date_range
+
+Filters = frappe._dict
 
 status_map = {
-    "Present": "P",
-    "Absent": "A",
-    "Half Day": "HD",
-    "Work From Home": "WFH",
-    "On Leave": "L",
-    "Holiday": "H",
-    "Weekly Off": "WO",
+	"Present": "P",
+	"Absent": "A",
+	"Half Day/Other Half Absent": "HD/A",
+	"Half Day/Other Half Present": "HD/P",
+	"Work From Home": "WFH",
+	"On Leave": "L",
+	"Holiday": "H",
+	"Weekly Off": "WO",
 }
 
 day_abbr = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-def extract_time(datetime_value) -> str:
-    """Extracts and returns the time part from a datetime object or string."""
-    if isinstance(datetime_value, datetime):
-        return datetime_value.strftime("%H:%M:%S")
-    elif isinstance(datetime_value, str) and datetime_value.strip():  # Check if string is not empty
-        return datetime.strptime(datetime_value, "%Y-%m-%d %H:%M:%S").strftime("%H:%M:%S")
-    return ""
-def execute(filters: Optional[Filters] = None) -> Tuple:
+
+def execute(filters: Filters | None = None) -> tuple:
 	filters = frappe._dict(filters or {})
 
-	if not (filters.month and filters.year):
+	if not filters.filter_based_on:
+		frappe.throw(_("Please select Filter Based On"))
+
+	if filters.filter_based_on == "Month" and not (filters.month and filters.year):
 		frappe.throw(_("Please select month and year."))
+
+	if filters.filter_based_on == "Date Range":
+		if not (filters.start_date and filters.end_date):
+			frappe.throw(_("Please set the date range."))
+		if getdate(filters.start_date) > getdate(filters.end_date):
+			frappe.throw(_("Start date cannot be greater than end date."))
+		if date_diff(filters.end_date, filters.start_date) > 90:
+			frappe.throw(_("Please set a date range less than 90 days."))
+
+	if not filters.company:
+		frappe.throw(_("Please select company."))
+
+	if filters.company:
+		filters.companies = [filters.company]
+		if filters.include_company_descendants:
+			filters.companies.extend(get_descendants_of("Company", filters.company))
 
 	attendance_map = get_attendance_map(filters)
 	if not attendance_map:
@@ -47,26 +77,33 @@ def execute(filters: Optional[Filters] = None) -> Tuple:
 	data = get_data(filters, attendance_map)
 
 	if not data:
-		frappe.msgprint(
-			_("No attendance records found for this criteria."), alert=True, indicator="orange"
-		)
+		frappe.msgprint(_("No attendance records found for this criteria."), alert=True, indicator="orange")
 		return columns, [], None, None
 
 	message = get_message() if not filters.summarized_view else ""
-	#chart = get_chart_data(attendance_map, filters)
+	chart = get_chart_data(attendance_map, filters)
 
-	return columns, data, message
+	return columns, data, message, chart
 
 
 def get_message() -> str:
 	message = ""
-	colors = ["green", "red", "orange", "green", "#318AD8", "", ""]
+	colors = [
+		"green",
+		"red",
+		"orange",
+		"#914EE3",
+		"green",
+		"#3187D8",
+		"#878787",
+		"#878787",
+	]
 
 	count = 0
 	for status, abbr in status_map.items():
 		message += f"""
 			<span style='border-left: 2px solid {colors[count]}; padding-right: 12px; padding-left: 5px; margin-right: 3px;'>
-				{status} - {abbr}
+				{_(status)} - {abbr}
 			</span>
 		"""
 		count += 1
@@ -74,7 +111,7 @@ def get_message() -> str:
 	return message
 
 
-def get_columns(filters: Filters) -> List[Dict]:
+def get_columns(filters: Filters) -> list[dict]:
 	columns = []
 
 	if filters.group_by:
@@ -157,40 +194,55 @@ def get_columns(filters: Filters) -> List[Dict]:
 	return columns
 
 
-def get_columns_for_leave_types() -> List[Dict]:
+def get_columns_for_leave_types() -> list[dict]:
 	leave_types = frappe.db.get_all("Leave Type", pluck="name")
 	types = []
 	for entry in leave_types:
-		types.append(
-			{"label": entry, "fieldname": frappe.scrub(entry), "fieldtype": "Float", "width": 120}
-		)
+		types.append({"label": entry, "fieldname": frappe.scrub(entry), "fieldtype": "Float", "width": 120})
 
 	return types
 
 
-def get_columns_for_days(filters: Filters) -> List[Dict]:
-    total_days = get_total_days_in_month(filters)
-    days = []
+def get_columns_for_days(filters: Filters) -> list[dict]:
+	days = []
+	dates_in_period = get_dates_in_period(filters)
+	for d in dates_in_period:
+		d = getdate(d)
+		# gets abbr from weekday number
+		abbr_weekday = day_abbr[d.weekday()]
+		# sets days as 1 Mon, 2 Tue, 3 Wed
+		label = f"{d.day} {abbr_weekday}"
+		days.append({"label": label, "fieldtype": "Data", "fieldname": d.strftime("%d-%m-%Y"), "width": 65})
 
-    for day in range(1, total_days + 1):
-        day_str = cstr(day)
-        date = "{}-{}-{}".format(cstr(filters.year), cstr(filters.month), day)
-        weekday = day_abbr[getdate(date).weekday()]
-        label = "{} {}".format(day, weekday)
-        days.append({"label": label, "fieldtype": "Data", "fieldname": day_str, "width": 125})
-        #days.append({"label": f"{label} In Time", "fieldtype": "Data", "fieldname": f"in_time_{day_str}", "width": 80})
-        #days.append({"label": f"{label} Out Time", "fieldtype": "Data", "fieldname": f"out_time_{day_str}", "width": 80})
-        #days.append({"label": f"{label} Leave Type", "fieldtype": "Data", "fieldname": f"leave_type{day_str}", "width": 150})
+	return days
 
-    return days
 
+def get_dates_in_period(filters: Filters) -> list[str]:
+	dates_in_period = []
+	if filters.filter_based_on == "Month":
+		total_days = get_total_days_in_month(filters)
+		# forms the datelist from selected year and month from filters
+		dates_in_period = [
+			f"{cstr(filters.year)}-{cstr(filters.month)}-{cstr(day)}" for day in range(1, total_days + 1)
+		]
+	if filters.filter_based_on == "Date Range":
+		dates_in_period = get_date_range(filters.start_date, filters.end_date)
+
+	return dates_in_period
 
 
 def get_total_days_in_month(filters: Filters) -> int:
 	return monthrange(cint(filters.year), cint(filters.month))[1]
 
 
-def get_data(filters: Filters, attendance_map: Dict) -> List[Dict]:
+def get_date_condition(docfield: Field, filters: Filters) -> Criterion:
+	if filters.filter_based_on == "Month":
+		return (Extract("month", docfield) == filters.month) & (Extract("year", docfield) == filters.year)
+	if filters.filter_based_on == "Date Range":
+		return (docfield >= filters.start_date) & (docfield <= filters.end_date)
+
+
+def get_data(filters: Filters, attendance_map: dict) -> list[dict]:
 	employee_details, group_by_param_values = get_employee_related_details(filters)
 	holiday_map = get_holiday_map(filters)
 	data = []
@@ -207,22 +259,26 @@ def get_data(filters: Filters, attendance_map: Dict) -> List[Dict]:
 			if records:
 				data.append({group_by_column: value})
 				data.extend(records)
+
 	else:
 		data = get_rows(employee_details, filters, holiday_map, attendance_map)
 
 	return data
 
 
-def get_attendance_map(filters: Filters) -> Dict:
+from typing import Dict
+
+def get_attendance_map(filters: Filters) -> dict:
+    """Returns a dictionary of employee-wise attendance map including leave types"""
     attendance_list = get_attendance_records(filters)
     attendance_map = {}
     leave_map = {}
 
     for d in attendance_list:
         if d.status == "On Leave":
-            leave_map.setdefault(d.employee, []).append({
-                "day": d.day_of_month,
-                "leave_type": d.leave_type
+            leave_map.setdefault(d.employee, {}).setdefault(d.shift, []).append({
+                "date": d.attendance_date,
+                "leave_type": d.leave_type  # store leave type
             })
             continue
 
@@ -230,70 +286,67 @@ def get_attendance_map(filters: Filters) -> Dict:
             d.shift = ""
 
         attendance_map.setdefault(d.employee, {}).setdefault(d.shift, {})
-        if d.status == "Present":
-            attendance_map[d.employee][d.shift][d.day_of_month] = {
-                "status": d.status,
-                "in_time": d.in_time,
-                "out_time": d.out_time
-            }
-        else:
-            attendance_map[d.employee][d.shift][d.day_of_month] = {"status": d.status}
+        attendance_map[d.employee][d.shift][d.attendance_date] = d.status
 
-    # leave is applicable for the entire day, so all shifts should show the leave entry
-    for employee, leave_entries in leave_map.items():
-        # no attendance records exist except leaves
-        if employee not in attendance_map:
-            attendance_map.setdefault(employee, {}).setdefault(None, {})
+    # Fill leave type in the attendance map
+    for employee, leave_days in leave_map.items():
+        for assigned_shift, leave_entries in leave_days.items():
+            if employee not in attendance_map:
+                attendance_map.setdefault(employee, {}).setdefault(assigned_shift, {})
 
-        for entry in leave_entries:
-            day = entry["day"]
-            leave_type = entry["leave_type"]
-            for shift in attendance_map[employee].keys():
-                attendance_map[employee][shift][day] = {
-                    "status": "On Leave",
-                    "leave_type": leave_type
-                }
+            for leave in leave_entries:
+                for shift in attendance_map[employee].keys():
+                    attendance_map[employee][shift][leave["date"]] = leave["leave_type"] or "On Leave"
 
     return attendance_map
 
 
+def get_attendance_records(filters: Filters) -> list[dict]:
+	Attendance = frappe.qb.DocType("Attendance")
+	attendance_date_condition = get_date_condition(Attendance.attendance_date, filters)
+	status = (
+		frappe.qb.terms.Case()
+		.when(
+			((Attendance.status == "Half Day") & (Attendance.half_day_status == "Present")),
+			"Half Day/Other Half Present",
+		)
+		.when(
+			((Attendance.status == "Half Day") & (Attendance.half_day_status == "Absent")),
+			"Half Day/Other Half Absent",
+		)
+		.else_(Attendance.status)
+	)
+	query = (
+		frappe.qb.from_(Attendance)
+		.select(
+			Attendance.employee,
+			Attendance.attendance_date,
+			(status).as_("status"),
+			Attendance.shift, Attendance.leave_type,
+		)
+		.where(
+			(Attendance.docstatus == 1)
+			& (Attendance.company.isin(filters.companies))
+			& (attendance_date_condition)
+		)
+	)
+
+	if filters.employee:
+		query = query.where(Attendance.employee == filters.employee)
+	query = query.orderby(Attendance.employee, Attendance.attendance_date)
+
+	return query.run(as_dict=1)
 
 
-def get_attendance_records(filters: Filters) -> List[Dict]:
-    Attendance = frappe.qb.DocType("Attendance")
-    query = (
-        frappe.qb.from_(Attendance)
-        .select(
-            Attendance.employee,
-            Extract("day", Attendance.attendance_date).as_("day_of_month"),
-            Attendance.status,
-            Attendance.in_time,
-            Attendance.out_time,
-            Attendance.shift,
-            Attendance.leave_type
-        )
-        .where(
-            (Attendance.docstatus == 1)
-            & (Attendance.company == filters.company)
-            & (Extract("month", Attendance.attendance_date) == filters.month)
-            & (Extract("year", Attendance.attendance_date) == filters.year)
-        )
-    )
-
-    if filters.employee:
-        query = query.where(Attendance.employee == filters.employee)
-    query = query.orderby(Attendance.employee, Attendance.attendance_date)
-
-    return query.run(as_dict=1)
-
-
-
-def get_employee_related_details(filters: Filters) -> Tuple[Dict, List]:
+def get_employee_related_details(filters: Filters) -> tuple[dict, list]:
 	"""Returns
 	1. nested dict for employee details
 	2. list of values for the group by filter
 	"""
 	Employee = frappe.qb.DocType("Employee")
+
+	joining_date_condition = get_date_condition(Employee.date_of_joining, filters)
+
 	query = (
 		frappe.qb.from_(Employee)
 		.select(
@@ -305,8 +358,16 @@ def get_employee_related_details(filters: Filters) -> Tuple[Dict, List]:
 			Employee.branch,
 			Employee.company,
 			Employee.holiday_list,
+			(Employee.date_of_joining).as_("joined_date"),
+			Case()
+			.when(
+				joining_date_condition,
+				1,
+			)
+			.else_(0)
+			.as_("joined_in_current_period"),
 		)
-		.where(Employee.company == filters.company)
+		.where(Employee.company.isin(filters.companies))
 	)
 
 	if filters.employee:
@@ -323,7 +384,8 @@ def get_employee_related_details(filters: Filters) -> Tuple[Dict, List]:
 	emp_map = {}
 
 	if group_by:
-		for parameter, employees in groupby(employee_details, key=lambda d: d[group_by]):
+		group_key = lambda d: "" if d[group_by] is None else d[group_by]  # noqa
+		for parameter, employees in groupby(sorted(employee_details, key=group_key), key=group_key):
 			group_by_param_values.append(parameter)
 			emp_map.setdefault(parameter, frappe._dict())
 
@@ -336,7 +398,7 @@ def get_employee_related_details(filters: Filters) -> Tuple[Dict, List]:
 	return emp_map, group_by_param_values
 
 
-def get_holiday_map(filters: Filters) -> Dict[str, List[Dict]]:
+def get_holiday_map(filters: Filters) -> dict[str, list[dict]]:
 	"""
 	Returns a dict of holidays falling in the filter month and year
 	with list name as key and list of holidays as values like
@@ -359,28 +421,23 @@ def get_holiday_map(filters: Filters) -> Dict[str, List[Dict]]:
 	holiday_map = frappe._dict()
 	Holiday = frappe.qb.DocType("Holiday")
 
+	holiday_condition = get_date_condition(Holiday.holiday_date, filters)
+
 	for d in holiday_lists:
 		if not d:
 			continue
 
 		holidays = (
 			frappe.qb.from_(Holiday)
-			.select(Extract("day", Holiday.holiday_date).as_("day_of_month"), Holiday.weekly_off)
-			.where(
-				(Holiday.parent == d)
-				& (Extract("month", Holiday.holiday_date) == filters.month)
-				& (Extract("year", Holiday.holiday_date) == filters.year)
-			)
+			.select(Holiday.holiday_date, Holiday.weekly_off)
+			.where((Holiday.parent == d) & (holiday_condition))
 		).run(as_dict=True)
-
 		holiday_map.setdefault(d, holidays)
 
 	return holiday_map
 
 
-def get_rows(
-	employee_details: Dict, filters: Filters, holiday_map: Dict, attendance_map: Dict
-) -> List[Dict]:
+def get_rows(employee_details: dict, filters: Filters, holiday_map: dict, attendance_map: dict) -> list[dict]:
 	records = []
 	default_holiday_list = frappe.get_cached_value("Company", filters.company, "default_holiday_list")
 
@@ -389,7 +446,9 @@ def get_rows(
 		holidays = holiday_map.get(emp_holiday_list)
 
 		if filters.summarized_view:
-			attendance = get_attendance_status_for_summarized_view(employee, filters, holidays)
+			attendance = get_attendance_status_for_summarized_view(
+				employee, filters, holidays, details.joined_in_current_period, details.joined_date
+			)
 			if not attendance:
 				continue
 
@@ -412,9 +471,8 @@ def get_rows(
 				employee, filters, employee_attendance, holidays
 			)
 			# set employee details in the first row
-			attendance_for_employee[0].update(
-				{"employee": employee, "employee_name": details.employee_name}
-			)
+			for record in attendance_for_employee:
+				record.update({"employee": employee, "employee_name": details.employee_name})
 
 			records.extend(attendance_for_employee)
 
@@ -428,8 +486,8 @@ def set_defaults_for_summarized_view(filters, row):
 
 
 def get_attendance_status_for_summarized_view(
-	employee: str, filters: Filters, holidays: List
-) -> Dict:
+	employee: str, filters: Filters, holidays: list, joined_in_current_period: int, joined_date: int
+) -> dict:
 	"""Returns dict of attendance status for employee like
 	{'total_present': 1.5, 'total_leaves': 0.5, 'total_absent': 13.5, 'total_holidays': 8, 'unmarked_days': 5}
 	"""
@@ -437,14 +495,15 @@ def get_attendance_status_for_summarized_view(
 	if not any(summary.values()):
 		return {}
 
-	total_days = get_total_days_in_month(filters)
+	total_days = get_dates_in_period(filters)
 	total_holidays = total_unmarked_days = 0
 
-	for day in range(1, total_days + 1):
-		if day in attendance_days:
+	for d in total_days:
+		d = getdate(d)
+		if d.day in attendance_days or (joined_in_current_period and d < joined_date):
 			continue
 
-		status = get_holiday_status(day, holidays)
+		status = get_holiday_status(d, holidays)
 		if status in ["Weekly Off", "Holiday"]:
 			total_holidays += 1
 		elif not status:
@@ -459,7 +518,7 @@ def get_attendance_status_for_summarized_view(
 	}
 
 
-def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Dict, List]:
+def get_attendance_summary_and_days(employee: str, filters: Filters) -> tuple[dict, list]:
 	Attendance = frappe.qb.DocType("Attendance")
 
 	present_case = (
@@ -478,6 +537,8 @@ def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Di
 	half_day_case = frappe.qb.terms.Case().when(Attendance.status == "Half Day", 0.5).else_(0)
 	sum_half_day = Sum(half_day_case).as_("total_half_days")
 
+	attendance_date_condition = get_date_condition(Attendance.attendance_date, filters)
+
 	summary = (
 		frappe.qb.from_(Attendance)
 		.select(
@@ -489,9 +550,8 @@ def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Di
 		.where(
 			(Attendance.docstatus == 1)
 			& (Attendance.employee == employee)
-			& (Attendance.company == filters.company)
-			& (Extract("month", Attendance.attendance_date) == filters.month)
-			& (Extract("year", Attendance.attendance_date) == filters.year)
+			& (Attendance.company.isin(filters.companies))
+			& (attendance_date_condition)
 		)
 	).run(as_dict=True)
 
@@ -502,9 +562,8 @@ def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Di
 		.where(
 			(Attendance.docstatus == 1)
 			& (Attendance.employee == employee)
-			& (Attendance.company == filters.company)
-			& (Extract("month", Attendance.attendance_date) == filters.month)
-			& (Extract("year", Attendance.attendance_date) == filters.year)
+			& (Attendance.company.isin(filters.companies))
+			& (attendance_date_condition)
 		)
 	).run(pluck=True)
 
@@ -512,57 +571,46 @@ def get_attendance_summary_and_days(employee: str, filters: Filters) -> Tuple[Di
 
 
 def get_attendance_status_for_detailed_view(
-    employee: str, filters: Filters, employee_attendance: Dict, holidays: List
-) -> List[Dict]:
-    """Returns list of shift-wise attendance status for employee
-    [
-            {'shift': 'Morning Shift', 1: 'A', 2: 'P', 3: 'A'...., 'in_time_1': '09:00', 'out_time_1': '18:00', ...},
-            {'shift': 'Evening Shift', 1: 'P', 2: 'A', 3: 'P'...., 'in_time_2': '09:00', 'out_time_2': '18:00', ...}
-    ]
-    """
-    total_days = get_total_days_in_month(filters)
+    employee: str, filters: Filters, employee_attendance: dict, holidays: list
+) -> list[dict]:
+    """Returns list of shift-wise attendance status for employee including leave types in blue"""
+    total_days = get_dates_in_period(filters)
     attendance_values = []
 
     for shift, status_dict in employee_attendance.items():
         row = {"shift": shift}
 
-        for day in range(1, total_days + 1):
-            day_str = cstr(day)
-            status_info = status_dict.get(day)
-            if status_info is None and holidays:
-                status_info = {'status': get_holiday_status(day, holidays)}
+        for d in total_days:
+            d = getdate(d)
+            status = status_dict.get(d)
 
-            if isinstance(status_info, dict):
-                status = status_info.get('status')
-                #in_time = extract_time(status_info.get('in_time', ''))
-                #out_time = extract_time(status_info.get('out_time', ''))
-                leave_type = status_info.get('leave_type', '')
-                abbr = status_map.get(status, "")
-                row[day_str] = abbr
-                #row[f"in_time_{day_str}"] = in_time
-                if leave_type:
-                	row[day_str] = leave_type
-                else:
-                	row[day_str] = abbr
-                #row[f"out_time_{day_str}"] = out_time
+            if status is None and holidays:
+                status = get_holiday_status(d, holidays)
+
+            # Determine abbreviation
+            if status not in status_map:
+                abbr = "".join([w[0].upper() for w in status.split()]) if status else ""
             else:
-                status = status_info
                 abbr = status_map.get(status, "")
-                row[day_str] = abbr
-                #row[f"in_time_{day_str}"] = ""
-                #row[f"leave_type{day_str}"] = ""
-                #row[f"out_time_{day_str}"] = ""
+
+            # Color leave types in blue
+            if status not in status_map:  # i.e., it's a leave type
+                abbr = f"<span style='color:#318AD8;'>{abbr}</span>"
+
+            row[d.strftime("%d-%m-%Y")] = abbr
 
         attendance_values.append(row)
 
     return attendance_values
 
 
-def get_holiday_status(day: int, holidays: List) -> str:
+
+
+def get_holiday_status(holiday_date: date, holidays: list) -> str:
 	status = None
 	if holidays:
 		for holiday in holidays:
-			if day == holiday.get("day_of_month"):
+			if holiday_date == holiday.get("holiday_date"):
 				if holiday.get("weekly_off"):
 					status = "Weekly Off"
 				else:
@@ -571,7 +619,7 @@ def get_holiday_status(day: int, holidays: List) -> str:
 	return status
 
 
-def get_leave_summary(employee: str, filters: Filters) -> Dict[str, float]:
+def get_leave_summary(employee: str, filters: Filters) -> dict[str, float]:
 	"""Returns a dict of leave type and corresponding leaves taken by employee like:
 	{'leave_without_pay': 1.0, 'sick_leave': 2.0}
 	"""
@@ -579,16 +627,17 @@ def get_leave_summary(employee: str, filters: Filters) -> Dict[str, float]:
 	day_case = frappe.qb.terms.Case().when(Attendance.status == "Half Day", 0.5).else_(1)
 	sum_leave_days = Sum(day_case).as_("leave_days")
 
+	attendance_date_condition = get_date_condition(Attendance.attendance_date, filters)
+
 	leave_details = (
 		frappe.qb.from_(Attendance)
 		.select(Attendance.leave_type, sum_leave_days)
 		.where(
 			(Attendance.employee == employee)
 			& (Attendance.docstatus == 1)
-			& (Attendance.company == filters.company)
+			& (Attendance.company.isin(filters.companies))
 			& ((Attendance.leave_type.isnotnull()) | (Attendance.leave_type != ""))
-			& (Extract("month", Attendance.attendance_date) == filters.month)
-			& (Extract("year", Attendance.attendance_date) == filters.year)
+			& (attendance_date_condition)
 		)
 		.groupby(Attendance.leave_type)
 	).run(as_dict=True)
@@ -601,7 +650,7 @@ def get_leave_summary(employee: str, filters: Filters) -> Dict[str, float]:
 	return leaves
 
 
-def get_entry_exits_summary(employee: str, filters: Filters) -> Dict[str, float]:
+def get_entry_exits_summary(employee: str, filters: Filters) -> dict[str, float]:
 	"""Returns total late entries and total early exits for employee like:
 	{'total_late_entries': 5, 'total_early_exits': 2}
 	"""
@@ -613,15 +662,16 @@ def get_entry_exits_summary(employee: str, filters: Filters) -> Dict[str, float]
 	early_exit_case = frappe.qb.terms.Case().when(Attendance.early_exit == "1", "1")
 	count_early_exits = Count(early_exit_case).as_("total_early_exits")
 
+	attendance_date_condition = get_date_condition(Attendance.attendance_date, filters)
+
 	entry_exits = (
 		frappe.qb.from_(Attendance)
 		.select(count_late_entries, count_early_exits)
 		.where(
 			(Attendance.docstatus == 1)
 			& (Attendance.employee == employee)
-			& (Attendance.company == filters.company)
-			& (Extract("month", Attendance.attendance_date) == filters.month)
-			& (Extract("year", Attendance.attendance_date) == filters.year)
+			& (Attendance.company.isin(filters.companies))
+			& (attendance_date_condition)
 		)
 	).run(as_dict=True)
 
@@ -633,9 +683,7 @@ def get_attendance_years() -> str:
 	"""Returns all the years for which attendance records exist"""
 	Attendance = frappe.qb.DocType("Attendance")
 	year_list = (
-		frappe.qb.from_(Attendance)
-		.select(Extract("year", Attendance.attendance_date).as_("year"))
-		.distinct()
+		frappe.qb.from_(Attendance).select(Extract("year", Attendance.attendance_date).as_("year")).distinct()
 	).run(as_dict=True)
 
 	if year_list:
@@ -646,7 +694,7 @@ def get_attendance_years() -> str:
 	return "\n".join(cstr(entry.year) for entry in year_list)
 
 
-def get_chart_data(attendance_map: Dict, filters: Filters) -> Dict:
+def get_chart_data(attendance_map: dict, filters: Filters) -> dict:
 	days = get_columns_for_days(filters)
 	labels = []
 	absent = []
@@ -657,9 +705,9 @@ def get_chart_data(attendance_map: Dict, filters: Filters) -> Dict:
 		labels.append(day["label"])
 		total_absent_on_day = total_leaves_on_day = total_present_on_day = 0
 
-		for employee, attendance_dict in attendance_map.items():
-			for shift, attendance in attendance_dict.items():
-				attendance_on_day = attendance.get(cint(day["fieldname"]))
+		for __, attendance_dict in attendance_map.items():
+			for __, attendance in attendance_dict.items():
+				attendance_on_day = attendance.get(getdate(day["fieldname"], parse_day_first=True))
 
 				if attendance_on_day == "On Leave":
 					# leave should be counted only once for the entire day
@@ -681,11 +729,14 @@ def get_chart_data(attendance_map: Dict, filters: Filters) -> Dict:
 		"data": {
 			"labels": labels,
 			"datasets": [
-				{"name": "Absent", "values": absent},
-				{"name": "Present", "values": present},
-				{"name": "Leave", "values": leave},
+				{"name": _("Absent"), "values": absent},
+				{"name": _("Present"), "values": present},
+				{"name": _("Leave"), "values": leave},
 			],
 		},
 		"type": "line",
 		"colors": ["red", "green", "blue"],
 	}
+
+
+
