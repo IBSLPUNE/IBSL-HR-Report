@@ -693,13 +693,13 @@ def get_attendance_years() -> str:
 
 	return "\n".join(cstr(entry.year) for entry in year_list)
 
-
 def get_chart_data(attendance_map: dict, filters: Filters) -> dict:
 	days = get_columns_for_days(filters)
 	labels = []
 	absent = []
 	present = []
 	leave = []
+	leave_types = [lt.name for lt in frappe.db.get_all("Leave Type", fields=["name"])]
 
 	for day in days:
 		labels.append(day["label"])
@@ -709,7 +709,7 @@ def get_chart_data(attendance_map: dict, filters: Filters) -> dict:
 			for __, attendance in attendance_dict.items():
 				attendance_on_day = attendance.get(getdate(day["fieldname"], parse_day_first=True))
 
-				if attendance_on_day == "On Leave":
+				if attendance_on_day in leave_types:
 					# leave should be counted only once for the entire day
 					total_leaves_on_day += 1
 					break
@@ -737,6 +737,9 @@ def get_chart_data(attendance_map: dict, filters: Filters) -> dict:
 		"type": "line",
 		"colors": ["red", "green", "blue"],
 	}
+
+
+
 
 
 
